@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+.venv-1/
+.venv312/
+venv/
+
+# Dependencies and build files
+.python_packages/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# Azure local secrets
+local.settings.json
+.env
+.env.*
+
+# Local Azure Storage emulator
+AzuriteConfig
+__azurite_db_*.json
+__blobstorage__/
+__queuestorage__/
+
+# VS Code
+.vscode/
+
+# Generated project output
+*.csv
+
+# Backup files
+*_backup.py
+*.backup
+
+# Operating system
+.DS_Store
+Thumbs.db
