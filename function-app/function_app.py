@@ -505,22 +505,38 @@ def process_anomaly_event(
     """Process a message received from Azure Event Hubs."""
 
     try:
-        raw_message = event.get_body().decode(
-            "utf-8"
-        )
+        raw_message = event.get_body().decode("utf-8")
 
         logging.info(
             "Received Event Hub message: %s",
             raw_message,
         )
 
-        event_data = json.loads(
-            raw_message
-        )
+        if not raw_message.strip():
+            logging.warning(
+                "Received an empty Event Hub message. Skipping."
+            )
+            return
+
+        try:
+            event_data = json.loads(raw_message)
+        except json.JSONDecodeError as exc:
+            logging.error(
+                "Invalid JSON received from Event Hub. Message=%r Error=%s",
+                raw_message,
+                exc,
+            )
+            return
+
 
         event_type = event_data.get(
             "eventType"
         )
+
+
+        
+
+
 
         symbol = event_data.get(
             "symbol",
