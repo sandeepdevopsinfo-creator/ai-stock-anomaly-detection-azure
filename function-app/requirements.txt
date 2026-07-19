@@ -6,10 +6,10 @@ azure-functions
 azure-storage-blob
 azure-monitor-opentelemetry
 pandas
-numpy
 scikit-learn
 yfinance
 azure-eventhub==5.15.1
 numpy
 requests
 azure-identity
+openai>=1.0.0

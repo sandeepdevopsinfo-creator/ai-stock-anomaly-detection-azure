@@ -10,12 +10,13 @@ import pandas as pd
 import yfinance as yf
 from azure.eventhub import EventData, EventHubProducerClient
 from azure.storage.blob import BlobServiceClient
+from openai import OpenAI
 from sklearn.ensemble import IsolationForest
 
 
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
 # Optional Azure Monitor / OpenTelemetry configuration
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
 
 try:
     from azure.monitor.opentelemetry import configure_azure_monitor
@@ -47,31 +48,131 @@ except Exception as telemetry_error:
 app = func.FunctionApp()
 
 
-# ---------------------------------------------------------
-# Helper: safely convert pandas/numpy values
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# Helper: generate Azure OpenAI explanation
+# -------------------------------------------------------------------
+
+def generate_ai_explanation(anomaly_data: dict[str, Any]) -> str:
+    """Generate a professional explanation for a detected stock anomaly."""
+
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+
+    missing_settings = []
+
+    if not endpoint:
+        missing_settings.append("AZURE_OPENAI_ENDPOINT")
+
+    if not api_key:
+        missing_settings.append("AZURE_OPENAI_API_KEY")
+
+    if not deployment_name:
+        missing_settings.append("AZURE_OPENAI_DEPLOYMENT")
+
+    if missing_settings:
+        logging.error(
+            "Missing Azure OpenAI settings: %s",
+            ", ".join(missing_settings),
+        )
+
+        return (
+            "AI explanation is unavailable because the "
+            "Azure OpenAI configuration is incomplete."
+        )
+
+    # AZURE_OPENAI_ENDPOINT must look like:
+    # https://YOUR-RESOURCE-NAME.openai.azure.com
+    if "/api/projects/" in endpoint:
+        logging.error(
+            "AZURE_OPENAI_ENDPOINT contains a Foundry project endpoint. "
+            "Use the Azure OpenAI endpoint ending in openai.azure.com."
+        )
+
+        return (
+            "AI explanation is unavailable because the configured endpoint "
+            "is a Foundry project endpoint instead of an Azure OpenAI endpoint."
+        )
+
+    base_url = endpoint.rstrip("/")
+
+    if not base_url.endswith("/openai/v1"):
+        base_url = f"{base_url}/openai/v1"
+
+    base_url = f"{base_url}/"
+
+    prompt = f"""
+You are an Azure AI stock-monitoring assistant.
+
+Analyze the following detected stock anomaly:
+
+{json.dumps(anomaly_data, indent=2)}
+
+Return the following:
+
+1. Short summary
+2. Possible reasons
+3. Risk level: Low, Medium, or High
+4. Recommended investigation step
+
+Keep the response under 150 words.
+Do not provide financial advice.
+"""
+
+    try:
+        ai_client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+        )
+
+        response = ai_client.responses.create(
+            model=deployment_name,
+            input=prompt,
+        )
+
+        explanation = response.output_text.strip()
+
+        logging.info(
+            "AI explanation generated successfully: %s",
+            explanation,
+        )
+
+        return explanation
+
+    except Exception as error:
+        logging.exception(
+            "AI explanation generation failed: %s",
+            error,
+        )
+
+        return "AI explanation could not be generated."
+
+
+# -------------------------------------------------------------------
+# Helpers: safely convert pandas/numpy values
+# -------------------------------------------------------------------
 
 def safe_float(value: Any) -> float | None:
-    """Convert a value to float, returning None for missing values."""
+    """Convert a value to float and return None for missing values."""
 
-    if pd.isna(value):
+    if value is None or pd.isna(value):
         return None
 
     return float(value)
 
 
 def safe_int(value: Any) -> int | None:
-    """Convert a value to int, returning None for missing values."""
+    """Convert a value to int and return None for missing values."""
 
-    if pd.isna(value):
+    if value is None or pd.isna(value):
         return None
 
     return int(value)
 
 
-# ---------------------------------------------------------
-# Helper: upload DataFrame to Azure Blob Storage
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# Helper: upload a DataFrame to Azure Blob Storage
+# -------------------------------------------------------------------
 
 def upload_csv_to_blob(
     dataframe: pd.DataFrame,
@@ -108,12 +209,12 @@ def upload_csv_to_blob(
         container_client.create_container()
 
         logging.info(
-            "Created Blob Storage container '%s'.",
+            "Created Blob Storage container: %s",
             container_name,
         )
 
     except Exception:
-        # The container probably already exists.
+        # The container likely already exists.
         pass
 
     blob_client = container_client.get_blob_client(
@@ -126,21 +227,21 @@ def upload_csv_to_blob(
     )
 
     logging.info(
-        "Uploaded '%s' successfully to Azure Blob Storage.",
+        "Uploaded %s successfully to Azure Blob Storage.",
         blob_name,
     )
 
 
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
 # Helper: send anomaly events to Azure Event Hubs
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
 
 def send_events_to_event_hub(
     anomalies: pd.DataFrame,
     symbol: str,
     execution_time: str,
 ) -> None:
-    """Send anomaly summary and anomaly details to Event Hubs."""
+    """Send an anomaly summary and anomaly records to Event Hubs."""
 
     connection_string = os.getenv(
         "EVENT_HUB_SEND_CONNECTION_STRING"
@@ -152,7 +253,7 @@ def send_events_to_event_hub(
 
     if not connection_string:
         raise ValueError(
-            "EVENT_HUB_CONNECTION_STRING is missing."
+            "EVENT_HUB_SEND_CONNECTION_STRING is missing."
         )
 
     if not event_hub_name:
@@ -168,14 +269,16 @@ def send_events_to_event_hub(
     try:
         event_batch = producer.create_batch()
 
+        anomaly_count = int(len(anomalies))
+
         summary_event = {
             "eventType": "StockAnomalyDetectionCompleted",
             "symbol": symbol,
             "executionTimeUtc": execution_time,
-            "anomalyCount": int(len(anomalies)),
+            "anomalyCount": anomaly_count,
             "status": (
                 "Alert"
-                if len(anomalies) > 0
+                if anomaly_count > 0
                 else "Normal"
             ),
         }
@@ -191,27 +294,13 @@ def send_events_to_event_hub(
                 "eventType": "StockAnomalyDetected",
                 "symbol": symbol,
                 "executionTimeUtc": execution_time,
-                "date": str(
-                    row.get("Date", "")
-                ),
-                "open": safe_float(
-                    row.get("Open")
-                ),
-                "high": safe_float(
-                    row.get("High")
-                ),
-                "low": safe_float(
-                    row.get("Low")
-                ),
-                "close": safe_float(
-                    row.get("Close")
-                ),
-                "volume": safe_int(
-                    row.get("Volume")
-                ),
-                "anomaly": safe_int(
-                    row.get("Anomaly")
-                ),
+                "date": str(row.get("Date", "")),
+                "open": safe_float(row.get("Open")),
+                "high": safe_float(row.get("High")),
+                "low": safe_float(row.get("Low")),
+                "close": safe_float(row.get("Close")),
+                "volume": safe_int(row.get("Volume")),
+                "anomaly": safe_int(row.get("Anomaly")),
             }
 
             event_batch.add(
@@ -223,9 +312,8 @@ def send_events_to_event_hub(
         producer.send_batch(event_batch)
 
         logging.info(
-            "Successfully sent %s anomaly event(s) "
-            "to Event Hub '%s'.",
-            len(anomalies),
+            "Successfully sent %s anomaly event(s) to Event Hub %s.",
+            anomaly_count,
             event_hub_name,
         )
 
@@ -233,9 +321,9 @@ def send_events_to_event_hub(
         producer.close()
 
 
-# ---------------------------------------------------------
-# Function 1: Timer-triggered anomaly detection
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# Function 1: timer-triggered stock anomaly detection
+# -------------------------------------------------------------------
 
 @app.timer_trigger(
     schedule="0 0 9 * * *",
@@ -247,8 +335,8 @@ def stock_anomaly_timer(
     mytimer: func.TimerRequest,
 ) -> None:
     """
-    Download MSFT data, detect anomalies, upload CSV files,
-    send events to Event Hubs, and record telemetry.
+    Download Microsoft stock data, detect anomalies, upload CSV files,
+    send Event Hub events, and generate an AI explanation.
     """
 
     symbol = "MSFT"
@@ -293,13 +381,12 @@ def stock_anomaly_timer(
 
         if mytimer.past_due:
             logging.warning(
-                "The timer trigger is running later "
-                "than scheduled."
+                "The timer trigger is running later than scheduled."
             )
 
-        # -------------------------------------------------
-        # Step 1: Download Microsoft stock data
-        # -------------------------------------------------
+        # -----------------------------------------------------------
+        # Step 1: Download stock data
+        # -----------------------------------------------------------
 
         stock = yf.download(
             tickers=symbol,
@@ -314,11 +401,8 @@ def stock_anomaly_timer(
                 "No Microsoft stock data was downloaded."
             )
 
-        # yfinance may return MultiIndex columns.
-        if isinstance(
-            stock.columns,
-            pd.MultiIndex,
-        ):
+        # yfinance can return MultiIndex columns.
+        if isinstance(stock.columns, pd.MultiIndex):
             stock.columns = [
                 column[0]
                 if isinstance(column, tuple)
@@ -328,86 +412,69 @@ def stock_anomaly_timer(
 
         if "Close" not in stock.columns:
             raise ValueError(
-                "Downloaded stock data does not "
-                "contain a Close column."
+                "Downloaded stock data does not contain a Close column."
             )
 
         stock = stock.reset_index()
 
-        logging.info(
-            "Downloaded %s stock records for %s.",
-            len(stock),
-            symbol,
-        )
+        # -----------------------------------------------------------
+        # Step 2: Prepare model data
+        # -----------------------------------------------------------
 
-        if main_span:
-            main_span.set_attribute(
-                "stock.downloaded_records",
-                len(stock),
-            )
+        required_columns = [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+        ]
 
-        # -------------------------------------------------
-        # Step 2: Prepare values for Isolation Forest
-        # -------------------------------------------------
+        available_columns = [
+            column
+            for column in required_columns
+            if column in stock.columns
+        ]
 
-        valid_close_prices = (
-            stock[["Close"]]
-            .dropna()
-        )
-
-        if len(valid_close_prices) < 10:
+        if not available_columns:
             raise ValueError(
-                "Not enough valid stock records "
-                "for anomaly detection."
+                "No numeric stock columns are available for detection."
             )
 
-        # -------------------------------------------------
-        # Step 3: Detect anomalies
-        # -------------------------------------------------
+        model_data = stock[
+            available_columns
+        ].copy()
 
-        model = IsolationForest(
-            contamination=0.02,
+        model_data = model_data.ffill().bfill()
+
+        if model_data.empty:
+            raise ValueError(
+                "Stock data is empty after preprocessing."
+            )
+
+        # -----------------------------------------------------------
+        # Step 3: Detect anomalies
+        # -----------------------------------------------------------
+
+        isolation_forest = IsolationForest(
+            n_estimators=200,
+            contamination=0.05,
             random_state=42,
         )
 
-        predictions = model.fit_predict(
-            valid_close_prices
-        )
-
-        stock["Anomaly"] = 1
-
-        stock.loc[
-            valid_close_prices.index,
-            "Anomaly",
-        ] = predictions
-
-        stock["Anomaly"] = (
-            stock["Anomaly"]
-            .fillna(1)
-            .astype(int)
+        stock["Anomaly"] = isolation_forest.fit_predict(
+            model_data
         )
 
         anomalies = stock[
             stock["Anomaly"] == -1
         ].copy()
 
-        anomaly_count = int(
-            len(anomalies)
+        anomaly_count = int(len(anomalies))
+
+        logging.info(
+            "Detected %s stock anomalies.",
+            anomaly_count,
         )
-
-        if anomaly_count > 0:
-            logging.warning(
-                "STOCK_ANOMALY_ALERT: %s anomalies "
-                "detected for %s.",
-                anomaly_count,
-                symbol,
-            )
-
-        else:
-            logging.info(
-                "No anomalies detected for %s.",
-                symbol,
-            )
 
         if main_span:
             main_span.set_attribute(
@@ -415,9 +482,9 @@ def stock_anomaly_timer(
                 anomaly_count,
             )
 
-        # -------------------------------------------------
-        # Step 4: Upload all stock data to Blob Storage
-        # -------------------------------------------------
+        # -----------------------------------------------------------
+        # Step 4: Upload stock and anomaly CSV files
+        # -----------------------------------------------------------
 
         upload_csv_to_blob(
             dataframe=stock,
@@ -425,19 +492,15 @@ def stock_anomaly_timer(
             blob_name="msft_stock_data.csv",
         )
 
-        # -------------------------------------------------
-        # Step 5: Upload anomaly-only data
-        # -------------------------------------------------
-
         upload_csv_to_blob(
             dataframe=anomalies,
             container_name="stock-data",
             blob_name="msft_anomaly_results.csv",
         )
 
-        # -------------------------------------------------
-        # Step 6: Send anomaly events to Event Hubs
-        # -------------------------------------------------
+        # -----------------------------------------------------------
+        # Step 5: Send Event Hub events
+        # -----------------------------------------------------------
 
         send_events_to_event_hub(
             anomalies=anomalies,
@@ -445,17 +508,55 @@ def stock_anomaly_timer(
             execution_time=current_time.isoformat(),
         )
 
+        # -----------------------------------------------------------
+        # Step 6: Generate an AI explanation
+        # -----------------------------------------------------------
+
+        if anomaly_count > 0:
+            first_anomaly = anomalies.iloc[0]
+
+            anomaly_data = {
+                "symbol": symbol,
+                "date": str(
+                    first_anomaly.get("Date", "")
+                ),
+                "open": safe_float(
+                    first_anomaly.get("Open")
+                ),
+                "high": safe_float(
+                    first_anomaly.get("High")
+                ),
+                "low": safe_float(
+                    first_anomaly.get("Low")
+                ),
+                "close": safe_float(
+                    first_anomaly.get("Close")
+                ),
+                "volume": safe_int(
+                    first_anomaly.get("Volume")
+                ),
+            }
+
+            ai_explanation = generate_ai_explanation(
+                anomaly_data
+            )
+
+            logging.info(
+                "AI Explanation: %s",
+                ai_explanation,
+            )
+
+        else:
+            logging.info(
+                "No AI explanation requested because no anomalies were found."
+            )
+
         logging.info(
-            "Stock anomaly detection completed. "
-            "Total anomalies: %s.",
+            "Stock anomaly detection completed. Total anomalies: %s.",
             anomaly_count,
         )
 
-        if (
-            main_span
-            and Status
-            and StatusCode
-        ):
+        if main_span and Status and StatusCode:
             main_span.set_status(
                 Status(
                     StatusCode.OK
@@ -468,11 +569,7 @@ def stock_anomaly_timer(
             error,
         )
 
-        if (
-            main_span
-            and Status
-            and StatusCode
-        ):
+        if main_span and Status and StatusCode:
             main_span.record_exception(error)
 
             main_span.set_status(
@@ -489,116 +586,67 @@ def stock_anomaly_timer(
             main_span.end()
 
 
-# ---------------------------------------------------------
-# Function 2: Event Hub consumer
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# Function 2: Event Hub anomaly-event processor
+# -------------------------------------------------------------------
 
 @app.event_hub_message_trigger(
     arg_name="event",
-    event_hub_name="stock-anomaly-events",
+    event_hub_name="%EVENT_HUB_NAME%",
     connection="EVENT_HUB_LISTEN_CONNECTION_STRING",
     consumer_group="anomaly-alert-consumer",
 )
 def process_anomaly_event(
     event: func.EventHubEvent,
 ) -> None:
-    """Process a message received from Azure Event Hubs."""
+    """Read and log stock-anomaly events received from Event Hubs."""
 
     try:
-        raw_message = event.get_body().decode("utf-8")
-
-        logging.info(
-            "Received Event Hub message: %s",
-            raw_message,
+        event_body = event.get_body().decode(
+            "utf-8"
         )
 
-        if not raw_message.strip():
-            logging.warning(
-                "Received an empty Event Hub message. Skipping."
-            )
-            return
-
-        try:
-            event_data = json.loads(raw_message)
-        except json.JSONDecodeError as exc:
-            logging.error(
-                "Invalid JSON received from Event Hub. Message=%r Error=%s",
-                raw_message,
-                exc,
-            )
-            return
-        logging.info(
-            "Successfully processed anomaly for %s",
-            event_data.get("symbol")
+        event_data = json.loads(
+            event_body
         )
 
         event_type = event_data.get(
-            "eventType"
-        )
-
-
-        
-
-
-
-        symbol = event_data.get(
-            "symbol",
+            "eventType",
             "Unknown",
         )
 
-        if (
-            event_type
-            == "StockAnomalyDetectionCompleted"
-        ):
-            anomaly_count = int(
-                event_data.get(
-                    "anomalyCount",
-                    0,
-                )
-            )
+        logging.info(
+            "Received Event Hub message: %s",
+            event_body,
+        )
 
-            status = event_data.get(
-                "status",
-                "Unknown",
-            )
-
-            logging.info(
-                "Detection summary received. "
-                "Symbol=%s, anomalyCount=%s, status=%s",
-                symbol,
-                anomaly_count,
-                status,
-            )
-
-            if anomaly_count > 0:
-                logging.warning(
-                    "ANOMALY ALERT RECEIVED: "
-                    "%s anomalies detected for %s.",
-                    anomaly_count,
-                    symbol,
-                )
-
-        elif (
-            event_type
-            == "StockAnomalyDetected"
-        ):
+        if event_type == "StockAnomalyDetected":
             logging.warning(
-                "Individual anomaly received. "
-                "Symbol=%s, Date=%s, Close=%s",
-                symbol,
+                "Individual anomaly received for %s on %s. Close: %s",
+                event_data.get("symbol"),
                 event_data.get("date"),
                 event_data.get("close"),
             )
 
+        elif event_type == "StockAnomalyDetectionCompleted":
+            logging.info(
+                "Detection summary received. Symbol: %s, "
+                "anomaly count: %s, status: %s",
+                event_data.get("symbol"),
+                event_data.get("anomalyCount"),
+                event_data.get("status"),
+            )
+
         else:
-            logging.warning(
-                "Unknown Event Hub event type: %s",
+            logging.info(
+                "Unhandled Event Hub event type: %s",
                 event_type,
             )
 
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as error:
         logging.exception(
-            "The Event Hub message was not valid JSON."
+            "Event Hub message was not valid JSON: %s",
+            error,
         )
 
         raise
