@@ -527,7 +527,10 @@ def process_anomaly_event(
                 exc,
             )
             return
-
+        logging.info(
+            "Successfully processed anomaly for %s",
+            event_data.get("symbol")
+        )
 
         event_type = event_data.get(
             "eventType"
