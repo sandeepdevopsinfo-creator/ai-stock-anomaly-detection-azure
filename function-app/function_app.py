@@ -326,7 +326,7 @@ def send_events_to_event_hub(
 # -------------------------------------------------------------------
 
 @app.timer_trigger(
-    schedule="0 0 9 * * *",
+    schedule="0 * * * * *",
     arg_name="mytimer",
     run_on_startup=True,
     use_monitor=True,
