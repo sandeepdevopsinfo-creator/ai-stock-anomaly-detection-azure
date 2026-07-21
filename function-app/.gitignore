@@ -40,3 +40,19 @@ __queuestorage__/
 # Operating system
 .DS_Store
 Thumbs.db
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+terraform-state-backup.json
+crash.log
+
+# Python and Azure Functions
+.venv/
+.venv312/
+.python_packages/
+**/__pycache__/
+local.settings.json

@@ -326,9 +326,9 @@ def send_events_to_event_hub(
 # -------------------------------------------------------------------
 
 @app.timer_trigger(
-    schedule="0 * * * * *",
+    schedule="0 0 9 * * *",
     arg_name="mytimer",
-    run_on_startup=True,
+    run_on_startup=False,
     use_monitor=True,
 )
 def stock_anomaly_timer(

@@ -1,0 +1,22 @@
+# Terraform
+**/.terraform/
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+**/terraform.tfvars
+terraform-state-backup.json
+crash.log
+
+# Python / Azure Functions
+**/.venv/
+**/.venv312/
+**/.python_packages/
+**/__pycache__/
+**/local.settings.json
+
+# Azurite
+**/__blobstorage__/
+**/__queuestorage__/
+**/__azurite_db_*.json
+**/AzuriteConfig
