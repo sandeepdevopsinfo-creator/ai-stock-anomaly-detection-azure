@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stock-anomaly-function
+  namespace: stock-anomaly
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stock-anomaly-function
+  template:
+    metadata:
+      labels:
+        app: stock-anomaly-function
+    spec:
+      containers:
+        - name: stock-anomaly-function
+          image: sandeepstockacr2026.azurecr.io/stock-anomaly-function:v1
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: stock-anomaly-secrets
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
